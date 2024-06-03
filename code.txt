@@ -1,0 +1,1045 @@
+import nltk
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf
+from pyspark.sql.types import ArrayType, StringType, StructType, StructField
+from pyspark.sql.functions import explode, desc
+from confluent_kafka import Producer
+import json
+
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+nltk.download('maxent_ne_chunker')
+nltk.download('words')
+
+# Function to perform NER using NLTK
+def extract_entities(text):
+    entities = []
+    # Tokenize the text
+    words = nltk.word_tokenize(text)
+    # Tag words with part-of-speech (POS) tags
+    tagged_words = nltk.pos_tag(words)
+    # Perform named entity chunking
+    chunked = nltk.ne_chunk(tagged_words)
+    # Extract named entities
+    for subtree in chunked:
+        if isinstance(subtree, nltk.tree.Tree):
+            entity = " ".join([word for word, tag in subtree.leaves()])
+            entities.append(entity.lower())
+    #print(entities, text)
+    return entities
+
+# Function to extract NER with ID
+def extract_entities_with_id(line):
+    # Extract NER from the input line
+    entities = extract_entities(line)
+    # Initialize a list to store the modified lines with ID
+    modified_lines = []
+    # Check if "Biden" or "Trump" is in the extracted entities
+    if "biden" in entities or "biden" in line.lower():
+        # Append (ID, input line) for "Biden" to the modified lines list
+        modified_lines.append({"ID":"Biden", "line":line})
+    if "trump" in entities or "trump" in line.lower():
+        # Append (ID, input line) for "Trump" to the modified lines list
+        modified_lines.append({"ID":"Trump", "line":line})
+    # Return the modified lines
+    return modified_lines
+
+# Register UDF (User Defined Function) for Spark DataFrame
+extract_entities_with_id_udf = udf(extract_entities_with_id, ArrayType(StructType([
+    StructField("ID", StringType(), False),
+    StructField("line", StringType(), False)
+])))
+
+def send_to_kafka(batch_df, batch_id):
+    producer = Producer({'bootstrap.servers': bootstrapServers})
+    messages = []
+    for row in batch_df.collect():
+        print(f"row {row}")
+        ID = row['entity']['ID']  # Accessing the 'ID' field from the StructType
+        line = row['entity']['line']  # Accessing the 'line' field from the StructType
+        messages.append({"ID": ID, "line": line})
+    batch_message = json.dumps(messages)
+    
+    producer.produce(output_topic, batch_message.encode('utf-8'))
+    producer.flush()
+
+
+if __name__ == "__main__":
+    bootstrapServers = "localhost:9092"
+    subscribeType = "subscribe"
+    input_topic = "reddit_producer"
+    output_topic = "filtered_data_producer"
+
+    spark = SparkSession\
+        .builder\
+        .appName("Consumer")\
+        .getOrCreate()
+
+    spark.sparkContext.setLogLevel("ERROR")
+
+    # Create DataSet representing the stream of input lines from Kafka
+    lines = spark\
+        .readStream\
+        .format("kafka")\
+        .option("kafka.bootstrap.servers", bootstrapServers)\
+        .option(subscribeType, input_topic)\
+        .load()\
+        .selectExpr("CAST(value AS STRING)")
+
+    # Extract named entities with ID from lines
+    entities_with_id_df = lines.select(extract_entities_with_id_udf('value').alias('entities_with_id'))
+
+    # Explode the array of entities with ID
+    exploded_entities_with_id_df = entities_with_id_df.select(explode('entities_with_id').alias('entity'))
+
+    # Start running the query that sends the modified lines with ID to Kafka
+    query = exploded_entities_with_id_df \
+        .writeStream \
+        .outputMode('append') \
+        .foreachBatch(send_to_kafka) \
+        .trigger(processingTime='5 seconds') \
+        .start()
+
+    query.awaitTermination()
+
+from collections import defaultdict
+from confluent_kafka import Consumer, KafkaError
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+plt.ion()
+
+def consume_from_kafka(consumer, topic):
+    consumer.subscribe([topic])
+    counts = defaultdict(int)
+    try:
+        while True:
+            msg = consumer.poll(timeout=1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                else:
+                    print(msg.error())
+                    break
+            else:
+                print(f"ID: {msg.value().decode('utf-8')}")
+                line = msg.value().decode('utf-8')
+                print(line)
+                
+                # Count mentions of Trump and Biden
+                counts['Trump'] += line.count('Trump')
+                counts['Biden'] += line.count('Biden')
+                print(counts)
+                # Plot frequency count over time
+                plt.clf()  # Clear the previous plot
+                plt.bar(counts.keys(), counts.values())
+                plt.xlabel('Politician')
+                plt.ylabel('Frequency')
+                plt.title('Mentions of Politicians over Time')
+                plt.draw()
+                plt.pause(0.001)  # Pause for a short time to allow the plot to update
+                # Generate timestamp
+                timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                
+                # Save the graph with timestamp
+                plt.savefig(f'freq_{timestamp}.png')
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        consumer.close()
+
+if __name__ == "__main__":
+    bootstrap_servers = "localhost:9092"
+    input_topic = "filtered_data_producer"
+
+    conf = {
+        'bootstrap.servers': bootstrap_servers,
+        'group.id': 'consumer_group',  
+        'auto.offset.reset': 'earliest',
+        'max.poll.interval.ms': 600000
+    }
+
+    consumer = Consumer(conf)
+    consume_from_kafka(consumer, input_topic)
+
+import praw
+from confluent_kafka import Producer
+import time
+import gpt
+
+text_file_path = f"./reddit_data.txt"
+prompt_path = f"./user_prompt.txt"
+
+reddit = praw.Reddit(
+    client_id="DZS3_bE4g2g8FNb2U_L4xg",
+    client_secret="00SS84JvkfzCKbBC__G-GDDLQKjruA",
+    user_agent="macos:com.example.myredditapp:v0.1 (by u/MaxToFerrari)",
+)
+
+p = Producer({'bootstrap.servers': "localhost:9092"})
+
+# Kafka topic to write messages to
+topic_name = "reddit_producer"
+
+# File path to write the flushed out data
+output_file_path = "reddit_data.txt"
+
+def delivery_report(err, msg):
+    """ Called once for each message produced to indicate delivery result.
+        Triggered by poll() or flush(). """
+    if err is not None:
+        print('Message delivery failed: {}'.format(err))
+    else:
+        print('Message delivered to {} [{}]'.format(msg.topic(), msg.partition()))
+        # Write the delivered message to the output file
+        with open(output_file_path, 'a', encoding = 'utf-8') as file:
+            file.write(msg.value().decode('utf-8') + '\n')
+
+def filter_for_relevance(data):
+    keywords = ["Biden", "Joe Biden", "Donald Trump", "Trump","Trump's", "Biden's"]
+    for keyword in keywords:
+        if keyword.lower() in data.lower():
+            return True
+    return False
+
+# Number of loops to run (adjust based on the desired duration)
+num_loops = 5  # Run for 5 intervals of 5 minutes each
+
+for i in range(num_loops):
+    start_time = time.time()
+    for submission in reddit.subreddit("all").stream.submissions(skip_existing=True):
+        # Trigger any available delivery report callbacks from previous produce() calls
+        p.poll(0)
+        data = submission.title
+        
+        data += " " + submission.selftext
+        # Check if the data is relevant
+        if filter_for_relevance(data):
+            print(data)
+            p.produce(topic_name, data.encode('utf-8'), callback=delivery_report)
+
+        elapsed_time = time.time() - start_time
+        if elapsed_time >= 120:  # 5 minutes
+            break  # Exit the loop if 5 minutes have elapsed
+
+    # Wait for any outstanding messages to be delivered and delivery report
+    # callbacks to be triggered.
+    p.flush()
+
+    # Sleep for 5 minutes before starting the next loop
+    if i < num_loops - 1:
+        print("Waiting for 5 minutes...")
+        response = gpt.text_summarize(text_file_path, prompt_path)
+        open(text_file_path, 'w', encoding='latin-1').close()
+        time.sleep(30)
+
+import os
+from openai import AzureOpenAI
+import json
+
+text_file_path = f"./reddit_data.txt"
+prompt_path = f"./user_prompt.txt"
+output_dir = f"./summarized_results.json"
+
+def read_config(file_path):
+    config = {}
+    with open(file_path, 'r') as file:
+        for line in file:
+            key, value = line.strip().split('=')
+            config[key] = value
+    return config
+
+# Read configuration from the file
+config_file_path = "openai_config.txt"
+
+def read_contents(file_path):
+    # Open the text file and read its contents
+    with open(file_path, 'r',encoding='latin-1') as file:
+        content = file.read()
+
+    # Return the content read from the file
+    return content
+
+def add_to_prompt(contents, prompt_path):
+    # Read the contents of the text file
+    with open(prompt_path, 'r',encoding='latin-1') as file:
+        file_content = file.read()
+    # Find the index where "Paragraphs to summarise" section ends
+    index = file_content.find("Paragraphs to summarise") + len("Paragraphs to summarise")
+    # If there's content below "Paragraphs to summarise", erase it
+    if index < len(file_content):
+        file_content = file_content[:index]
+    # Write the updated content back to the file
+    with open(prompt_path, 'w',encoding='latin-1') as file:
+        file.write(file_content)
+
+def write_to_json(contents, summary, output_dir):
+    """Write contents and summary to a JSON file with unique IDs."""
+    os.makedirs(output_dir, exist_ok=True)
+    serial_number = 1
+    while os.path.exists(os.path.join(output_dir, f"data_{serial_number}.json")):
+        serial_number += 1
+    data = {
+        "text": contents,
+        "summary": summary
+    }
+    output_file = os.path.join(output_dir, f"data_{serial_number}.json")
+    with open(output_file, 'w', encoding='utf-8') as file:
+        json.dump(data, file, ensure_ascii=False, indent=4)
+    print(f"Data written to: {output_file}")
+
+def chatgpt_interaction(prompt_path):
+    config = read_config(config_file_path)
+    client = AzureOpenAI(
+        api_key=config["API_KEY"],
+        api_version=config["API_VERSION"],
+        azure_endpoint=config["AZURE_ENDPOINT"]
+    )
+    messages = []
+    
+    with open(prompt_path, 'r',encoding='latin-1') as file:
+        prompt_content = file.read()
+    messages = [{'role': 'user', 'content': prompt_content}]
+    response = client.chat.completions.create(
+        model="gpt-35",
+        messages=messages,
+        temperature=0.7,
+    )
+    assistant_response = response.choices[0].message.content
+    messages.append({'role': 'assistant', 'content': assistant_response})
+    return assistant_response
+
+def text_summarize(text_file_path, prompt_path):
+    contents = read_contents(text_file_path)
+    add_to_prompt(contents, prompt_path)
+    gpt_response = chatgpt_interaction(prompt_path)
+    print("--------------------------------------------------------------------------------------------------")
+    print(gpt_response)
+    print("--------------------------------------------------------------------------------------------------")
+    write_to_json(contents, gpt_response, output_dir)
+    return(gpt_response)
+
+import time
+import json
+import matplotlib.pyplot as plt
+from collections import defaultdict
+from confluent_kafka import Consumer, KafkaError
+from datetime import datetime
+
+# Kafka parameters
+bootstrap_servers = 'localhost:9092'
+group_id = 'matplotlib_comments_consumer_group'
+input_topic = 'user_engagement_analysis_producer'  # Topic for user engagement analysis data
+
+
+# Kafka consumer configuration
+consumer_config = {
+    'bootstrap.servers': bootstrap_servers,
+    'group.id': group_id,
+    'auto.offset.reset': 'latest'
+}
+
+# Create Kafka consumer
+consumer = Consumer(consumer_config)
+consumer.subscribe([input_topic])
+
+# Dictionary to store data for plotting
+upvotes_data = defaultdict(list)
+start_time = time.time()  # Get the time when the program started
+
+# Main loop to consume data from Kafka and plot graphs using Matplotlib
+try:
+    flag = False
+    i = 0
+    while True:
+        msg = consumer.poll(timeout=1.0)
+        
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            else:
+                print(msg.error())
+                break
+
+        data = json.loads(msg.value())  # Parse JSON string to dictionary
+        print(data)
+        if not data:
+            continue
+        if not flag:
+            flag = True
+            start_time = time.time()
+        i += 1
+        # Process user engagement analysis data
+        for item in data:
+            item_data = json.loads(item)  # Parse JSON string to dictionary
+            ID = item_data['ID']
+            time_elapsed = 6 * i
+            upvotes_data[ID].append((time_elapsed, item_data['sum(comments)']))
+        
+        # Plot graphs for user engagement
+        plt.figure(figsize=(10, 6))
+        for ID, values in upvotes_data.items():
+            x, y = zip(*values)
+            print(x, y)
+            plt.plot(x, y, label=ID)
+        plt.xlabel('Time (hours since start)')
+        plt.ylabel('Number of Comments')
+        plt.title('User Engagement - Comments')
+        plt.legend()
+        plt.draw()
+        plt.pause(0.001)  # Pause for a short time to allow the plot to update
+        # Generate timestamp
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        
+        # Save the graph with timestamp
+        plt.savefig(f'3_2_{timestamp}.png')
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    consumer.close()
+
+import json
+import matplotlib.pyplot as plt
+from collections import defaultdict
+from confluent_kafka import Consumer, KafkaError
+from datetime import datetime
+
+# Kafka parameters
+bootstrap_servers = 'localhost:9092'
+group_id = 'url_analysis_consumer_group'
+url_topic = 'url_analysis_producer'  # Topic for URL analysis data
+
+# Kafka consumer configuration
+consumer_config = {
+    'bootstrap.servers': bootstrap_servers,
+    'group.id': group_id,
+    'auto.offset.reset': 'latest'
+}
+
+# Create Kafka consumer
+consumer = Consumer(consumer_config)
+consumer.subscribe([url_topic])
+
+# Dictionary to store data for plotting
+data_dict = defaultdict(int)
+
+# Main loop to consume data from Kafka and plot URL analysis bar graph using Matplotlib
+try:
+    while True:
+        msg = consumer.poll(timeout=1.0)
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            else:
+                print(msg.error())
+                break
+
+        data = json.loads(msg.value())
+        print(data)
+        # Process URL analysis data
+        for item in data:
+            # Assuming the item structure is {'ID': 'Biden', 'domain': 'example.com', 'count': 10}
+            # If the structure is different, adjust the code accordingly
+            item_data = json.loads(item)
+            domain = item_data['domain']
+            count = item_data['count']
+            data_dict[domain] += count
+
+        # Plot bar graph
+        plt.figure(figsize=(10, 6))
+        plt.bar(data_dict.keys(), data_dict.values(), color=['blue', 'red'])
+        plt.xlabel('Organization Name')
+        plt.ylabel('Count')
+        plt.title('URL Analysis')
+        plt.xticks(rotation=45, ha='right')  # Rotate x-axis labels
+        plt.tight_layout()  # Adjust layout to prevent overlapping
+        plt.draw()
+        plt.pause(0.001)  # Pause for a short time to allow the plot to update
+        # Generate timestamp
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        
+        # Save the graph with timestamp
+        plt.savefig(f'3_3_{timestamp}.png')
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    consumer.close()
+
+import nltk
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf, from_json
+from pyspark.sql.types import ArrayType, StringType, StructType, StructField
+from pyspark.sql.functions import explode
+from confluent_kafka import Producer
+import json
+
+nltk.download('punkt')
+nltk.download('averaged_perceptron_tagger')
+nltk.download('maxent_ne_chunker')
+nltk.download('words')
+
+# Function to perform NER using NLTK
+def extract_entities(text):
+    entities = []
+    # Tokenize the text
+    words = nltk.word_tokenize(text)
+    # Tag words with part-of-speech (POS) tags
+    tagged_words = nltk.pos_tag(words)
+    # Perform named entity chunking
+    chunked = nltk.ne_chunk(tagged_words)
+    # Extract named entities
+    for subtree in chunked:
+        if isinstance(subtree, nltk.tree.Tree):
+            entity = " ".join([word for word, tag in subtree.leaves()])
+            entities.append(entity.lower())
+    return entities
+
+# Function to extract NER with ID
+def extract_entities_with_id(post_data):
+    entities = extract_entities(post_data['title'] + ' ' + post_data['text'])
+    modified_lines = []
+    if "biden" in entities or "biden" in (post_data['title'] + ' ' + post_data['text']).lower():
+        modified_lines.append({"ID":"Biden", "post_data": post_data})
+    if "trump" in entities or "trump" in (post_data['title'] + ' ' + post_data['text']).lower():
+        modified_lines.append({"ID":"Trump", "post_data": post_data})
+    return modified_lines
+
+# Register UDF (User Defined Function) for Spark DataFrame
+extract_entities_with_id_udf = udf(extract_entities_with_id, ArrayType(StructType([
+    StructField("ID", StringType(), False),
+    StructField("post_data", StructType([
+        StructField("title", StringType(), False),
+        StructField("text", StringType(), False),
+        StructField("url", StringType(), False),
+        StructField("upvotes", StringType(), False),
+        StructField("comments", StringType(), False)
+    ]), False)
+])))
+
+def send_to_kafka_with_print(batch_df, batch_id):
+    print("Sending data to Kafka at batch ID:", batch_id)
+    print("Data arrived:", batch_df.collect())
+    producer = Producer({'bootstrap.servers': bootstrapServers})
+    messages = []
+    for row in batch_df.collect():
+        ID = row['entity']['ID']
+        post_data = row['entity']['post_data']
+        # Include keys for the post_data list
+        post_data_dict = {
+            "title": post_data[0],
+            "text": post_data[1],
+            "url": post_data[2],
+            "upvotes": post_data[3],
+            "comments": post_data[4]
+        }
+        messages.append({"ID": ID, "post_data": post_data_dict})
+    batch_message = json.dumps(messages)
+    print("Data stored to Kafka:", batch_message)
+    producer.produce(output_topic, batch_message.encode('utf-8'))
+    producer.flush()
+
+if __name__ == "__main__":
+    bootstrapServers = "localhost:9092"
+    subscribeType = "subscribe"
+    input_topic = "reddit_hot_posts_producer"
+    output_topic = "hot_posts_filtered_data_producer"
+
+    spark = SparkSession\
+        .builder\
+        .appName("Consumer")\
+        .getOrCreate()
+
+    spark.sparkContext.setLogLevel("ERROR")
+
+    print("SparkSession initialized.")
+
+    # Create DataSet representing the stream of input lines from Kafka
+    lines = spark\
+        .readStream\
+        .format("kafka")\
+        .option("kafka.bootstrap.servers", bootstrapServers)\
+        .option(subscribeType, input_topic)\
+        .option("startingOffsets", "latest")\
+        .load()\
+        .selectExpr("CAST(value AS STRING)")
+
+    print("Connected to Kafka topic:", input_topic)
+
+    # Convert JSON string to StructType
+    json_schema = StructType([
+        StructField("title", StringType(), True),
+        StructField("text", StringType(), True),
+        StructField("url", StringType(), True),
+        StructField("upvotes", StringType(), True),
+        StructField("comments", StringType(), True)
+    ])
+    lines = lines.selectExpr("CAST(value AS STRING)")
+    lines = lines.select(from_json(lines.value, json_schema).alias("post_data"))
+
+    print("JSON schema defined.")
+
+    # Extract named entities with ID from post_data
+    entities_with_id_df = lines.select(extract_entities_with_id_udf('post_data').alias('entities_with_id'))
+
+    print("Named entities extracted.")
+
+    # Explode the array of entities with ID
+    exploded_entities_with_id_df = entities_with_id_df.select(explode('entities_with_id').alias('entity'))
+
+    print("Entities exploded.")
+
+    # Start running the query that sends the modified lines with ID to Kafka
+    query = exploded_entities_with_id_df \
+        .writeStream \
+        .outputMode('append') \
+        .foreachBatch(lambda batch_df, batch_id: send_to_kafka_with_print(batch_df, batch_id)) \
+        .trigger(processingTime='5 seconds') \
+        .start()
+
+    print("Streaming query started.")
+
+    query.awaitTermination()
+    
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, from_json, explode, regexp_extract, sum as sql_sum
+import re
+from confluent_kafka import Producer
+import json
+
+# Initialize SparkSession
+spark = SparkSession.builder \
+    .appName("User_Engagement_and_URL_Analysis") \
+    .getOrCreate()
+spark.sparkContext.setLogLevel('ERROR')
+
+# Define the Kafka parameters
+kafka_bootstrap_servers = "localhost:9092"
+input_topic = "hot_posts_filtered_data_producer"
+engagement_output_topic = "user_engagement_analysis_producer"
+url_output_topic = "url_analysis_producer"
+
+# Define the schema for the data
+schema = "ID STRING, post_data STRUCT<title: STRING, text: STRING, url: STRING, upvotes: STRING, comments: STRING>"
+
+# Load data from Kafka topic into a DataFrame
+df = spark \
+    .readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", kafka_bootstrap_servers) \
+    .option("subscribe", input_topic) \
+    .option("startingOffsets", "latest") \
+    .load()
+
+# Extract fields from the nested structure
+parsed_df = df \
+    .selectExpr("CAST(value AS STRING)") \
+    .select(explode(from_json(col("value"), "ARRAY<STRING>")).alias("value")) \
+    .select(from_json(col("value"), schema).alias("data")) \
+    .select("data.*")
+
+# User Engagement Analysis: Convert upvotes and comments to integer type
+engagement_df = parsed_df \
+    .withColumn("upvotes", col("post_data.upvotes").cast("int")) \
+    .withColumn("comments", col("post_data.comments").cast("int"))
+
+# Calculate cumulative sum of upvotes and comments for each ID (Trump/Biden)
+engagement_analysis = engagement_df \
+    .groupBy("ID") \
+    .agg({"upvotes": "sum", "comments": "sum"}) \
+    .orderBy("ID")
+
+# URL Analysis: Extract domains from URLs
+def extract_domain(url):
+    if url:
+        # Regular expression to extract domain from URL
+        pattern = r"https?://(?:www\.)?([^/]+)"
+        matches = re.findall(pattern, url)
+        if matches:
+            return matches[0]
+    return None
+
+# User-defined function (UDF) to extract domain from URL
+extract_domain_udf = spark.udf.register("extract_domain", extract_domain)
+
+# Apply UDF to extract domain from URLs
+url_analysis = parsed_df \
+    .withColumn("domain", extract_domain_udf(col("post_data.url"))) \
+    .groupBy("ID", "domain") \
+    .count() \
+    .orderBy("ID", "count", ascending=False)
+
+# Function to send data to Kafka
+def send_to_kafka(topic, data):
+    producer = Producer({'bootstrap.servers': kafka_bootstrap_servers})
+    producer.produce(topic, json.dumps(data).encode('utf-8'))
+    producer.flush()
+    print(f"Data sent to Kafka topic '{topic}'")
+    print("Data:", data)  # Print the data sent to Kafka
+
+# Start the streaming queries to output user engagement and URL analysis
+query1 = engagement_analysis \
+    .writeStream \
+    .outputMode("complete") \
+    .foreachBatch(lambda batch_df, batch_id: send_to_kafka(engagement_output_topic, batch_df.toJSON().collect())) \
+    .start()
+
+query2 = url_analysis \
+    .writeStream \
+    .outputMode("complete") \
+    .foreachBatch(lambda batch_df, batch_id: send_to_kafka(url_output_topic, batch_df.toJSON().collect())) \
+    .start()
+
+query1.awaitTermination()
+query2.awaitTermination()
+
+import time
+import json
+import matplotlib.pyplot as plt
+from collections import defaultdict
+from confluent_kafka import Consumer, KafkaError
+from datetime import datetime
+
+# Kafka parameters
+bootstrap_servers = 'localhost:9092'
+group_id = 'matplotlib_upvotes_consumer_group'
+input_topic = 'user_engagement_analysis_producer'  # Topic for user engagement analysis data
+
+
+# Kafka consumer configuration
+consumer_config = {
+    'bootstrap.servers': bootstrap_servers,
+    'group.id': group_id,
+    'auto.offset.reset': 'latest'
+}
+
+# Create Kafka consumer
+consumer = Consumer(consumer_config)
+consumer.subscribe([input_topic])
+
+# Dictionary to store data for plotting
+upvotes_data = defaultdict(list)
+start_time = time.time()  # Get the time when the program started
+
+# Main loop to consume data from Kafka and plot graphs using Matplotlib
+try:
+    flag = False
+    i = 0
+    while True:
+        msg = consumer.poll(timeout=1.0)
+        
+        if msg is None:
+            continue
+        if msg.error():
+            if msg.error().code() == KafkaError._PARTITION_EOF:
+                continue
+            else:
+                print(msg.error())
+                break
+
+        data = json.loads(msg.value())  # Parse JSON string to dictionary
+        print(data)
+        if not data:
+            continue
+        if not flag:
+            flag = True
+            start_time = time.time()
+        # Process user engagement analysis data
+        i += 1
+        for item in data:
+            item_data = json.loads(item)  # Parse JSON string to dictionary
+            ID = item_data['ID']
+            time_elapsed = 6 * i
+            upvotes_data[ID].append((time_elapsed, item_data['sum(upvotes)']))
+        
+        # Plot graphs for user engagement
+        plt.figure(figsize=(10, 6))
+        for ID, values in upvotes_data.items():
+            x, y = zip(*values)
+            print(x, y)
+            plt.plot(x, y, label=ID)
+        plt.xlabel('Time (hours since start)')
+        plt.ylabel('Number of Upvotes')
+        plt.title('User Engagement - Upvotes')
+        plt.legend()
+        plt.draw()
+        plt.pause(0.001)  # Pause for a short time to allow the plot to update
+        # Generate timestamp
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        
+        # Save the graph with timestamp
+        plt.savefig(f'3_{timestamp}.png')
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    consumer.close()
+
+import praw
+from confluent_kafka import Producer
+
+reddit = praw.Reddit(
+    client_id="DZS3_bE4g2g8FNb2U_L4xg",
+    client_secret="00SS84JvkfzCKbBC__G-GDDLQKjruA",
+    user_agent="macos:com.example.myredditapp:v0.1 (by u/MaxToFerrari)",
+)
+
+p = Producer({'bootstrap.servers': "localhost:9092"})
+
+# Kafka topic to write messages to
+topic_name = "reddit_hot_posts_producer"
+
+def delivery_report(err, msg):
+    """ Called once for each message produced to indicate delivery result.
+        Triggered by poll() or flush(). """
+    if err is not None:
+        print('Message delivery failed: {}'.format(err))
+    else:
+        print('Message delivered to {} [{}]'.format(msg.topic(), msg.partition()))
+
+# Specify the subreddit to fetch hot posts from
+subreddit_name = "politics"
+
+for submission in reddit.subreddit(subreddit_name).top(time_filter="day", limit=10):
+    # Trigger any available delivery report callbacks from previous produce() calls
+    p.poll(0)
+
+    # Asynchronously produce a message. The delivery report callback will
+    # be triggered from the call to poll() above, or flush() below, when the
+    # message has been successfully delivered or failed permanently.
+    post_data = {
+        "title": submission.title,
+        "text": submission.selftext,
+        "url": submission.url,
+        "upvotes": submission.score,
+        "comments": submission.num_comments
+    }
+    print(post_data)
+    p.produce(topic_name, str(post_data).encode('utf-8'), callback=delivery_report)
+
+# Wait for any outstanding messages to be delivered and delivery report
+# callbacks to be triggered.
+p.flush()
+
+import praw
+from confluent_kafka import Producer
+
+reddit = praw.Reddit(
+    client_id="DZS3_bE4g2g8FNb2U_L4xg",
+    client_secret="00SS84JvkfzCKbBC__G-GDDLQKjruA",
+    user_agent="macos:com.example.myredditapp:v0.1 (by u/MaxToFerrari)",
+)
+
+p = Producer({'bootstrap.servers': "localhost:9092"})
+
+# Kafka topic to write messages to
+topic_name = "reddit_producer"
+
+def delivery_report(err, msg):
+    """ Called once for each message produced to indicate delivery result.
+        Triggered by poll() or flush(). """
+    if err is not None:
+        print('Message delivery failed: {}'.format(err))
+    else:
+        print('Message delivered to {} [{}]'.format(msg.topic(), msg.partition()))
+
+
+for submission in reddit.subreddit("all").stream.submissions(skip_existing=True):
+    # Trigger any available delivery report callbacks from previous produce() calls
+    p.poll(0)
+
+    # Asynchronously produce a message. The delivery report callback will
+    # be triggered from the call to poll() above, or flush() below, when the
+    # message has been successfully delivered or failed permanently.
+    data = submission.title
+    #if (len(submission.selftext) < 500):
+    data += " " + submission.selftext
+    print(data)
+    p.produce(topic_name, data.encode('utf-8'), callback=delivery_report)
+
+# Wait for any outstanding messages to be delivered and delivery report
+# callbacks to be triggered.
+p.flush()
+
+from collections import defaultdict
+from confluent_kafka import Consumer, KafkaError
+import matplotlib.pyplot as plt
+import joblib
+from datetime import datetime
+import re
+from string import punctuation
+
+def preProcessor(text):
+    text = re.sub(r'(http|ftp|https):\/\/([\w\-]+(?:(?:\.[\w\-]+)+))([\w\-\.,@?^=%&:/\+#]*[\w\-\@?^=%&/\+#])?', ' ', text)
+    text = re.sub(r'[' + punctuation + ']', ' ', text)
+    text = re.sub(r'#(\w + )', ' ', text)
+    text = re.sub(r'@(\w + )', ' ', text)
+    return text
+
+# Load the saved model and CountVectorizer configuration
+model_and_cv = joblib.load('svm_model_and_cv.pkl')
+clf = model_and_cv['model']
+cvm = model_and_cv['cv']
+
+# Define a function for preprocessing and prediction
+def predict_sentiment_pipeline(text):
+    # Preprocess the input text
+    preprocessed_text = preProcessor(text)
+    
+    # Transform the preprocessed text using CountVectorizer
+    text_counts = cvm.transform([preprocessed_text])
+    
+    # Predict the sentiment using the trained SVM model
+    sentiment = clf.predict(text_counts)
+    
+    return sentiment[0]
+
+plt.ion()
+
+def consume_from_kafka(consumer, topic):
+    consumer.subscribe([topic])
+    sentiment_counts = defaultdict(int)
+    try:
+        while True:
+            msg = consumer.poll(timeout=1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                if msg.error().code() == KafkaError._PARTITION_EOF:
+                    continue
+                else:
+                    print(msg.error())
+                    break
+            else:
+                data = msg.value().decode('utf-8')
+                data = eval(data)  # Convert string representation of dictionary to dictionary
+                print(len(data))
+                if not data:
+                    continue
+                for data_item in data:
+                    politician = data_item['ID']
+                    line = data_item['line']
+                    
+                    # Get sentiment and count sentiment mentions
+                    sentiment = predict_sentiment_pipeline(line)
+
+                    sentiment_counts[(politician, sentiment)] += 1
+                
+                # Plot frequency count over time
+                plt.clf()  # Clear the previous plot
+                
+                colors = {'Trump': 'red', 'Biden': 'blue'}
+                x_labels_order = ['Biden_negative', 'Biden_neutral', 'Biden_positive', 'Trump_negative', 'Trump_neutral', 'Trump_positive']
+                for label in x_labels_order:
+                    politician, sentiment = label.split('_')
+                    plt.bar(label, sentiment_counts[(politician, sentiment)], color=colors[politician])
+                
+                plt.xlabel('Politician Sentiment')
+                plt.ylabel('Number of posts')
+                plt.title('Sentiment Analysis')
+                plt.xticks(rotation=45, ha='right')  # Rotate x-axis labels
+                plt.tight_layout()  # Adjust layout to prevent overlapping
+                plt.draw()
+                plt.pause(0.001)  # Pause for a short time to allow the plot to update
+                
+                # Generate timestamp
+                timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                
+                # Save the graph with timestamp
+                plt.savefig(f'sentiment_analysis_{timestamp}.png')
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        consumer.close()
+
+if __name__ == "__main__":
+    bootstrap_servers = "localhost:9092"
+    input_topic = "filtered_data_producer"
+
+    conf = {
+        'bootstrap.servers': bootstrap_servers,
+        'group.id': 'consumer_group',  
+        'auto.offset.reset': 'earliest',
+        'max.poll.interval.ms': 600000
+    }
+
+    consumer = Consumer(conf)
+    consume_from_kafka(consumer, input_topic)
+
+from pyspark import SparkContext
+from pyspark.mllib.feature import HashingTF
+from pyspark.mllib.regression import LabeledPoint
+from sklearn.svm import SVC
+from sklearn.feature_extraction.text import CountVectorizer
+from nltk.tokenize import RegexpTokenizer
+import re
+from string import punctuation
+import joblib
+
+# Initialize Spark context
+sc = SparkContext(appName="SentimentAnalysis")
+
+# Load the dataset
+data = sc.textFile("Twitter_Data.csv")
+header = data.first()
+data = data.filter(lambda x: x != header).map(lambda x: x.split(","))
+header_split = header.split(",")
+clean_text_index = header_split.index("clean_text")
+sentiment_index = header_split.index("sentiment")
+
+# Data preprocessing
+def preProcessor(text):
+    text = re.sub(r'(http|ftp|https):\/\/([\w\-]+(?:(?:\.[\w\-]+)+))([\w\-\.,@?^=%&:/\+#]*[\w\-\@?^=%&/\+#])?', ' ', text)
+    text = re.sub(r'[' + punctuation + ']', ' ', text)
+    text = re.sub(r'#(\w + )', ' ', text)
+    text = re.sub(r'@(\w + )', ' ', text)
+    return text
+
+preprocessed_data = data.map(lambda x: (preProcessor(x[clean_text_index]), x[sentiment_index]))
+
+# Tokenization and feature extraction
+tokenizer = RegexpTokenizer(r'\w+')
+tokenized_data = preprocessed_data.map(lambda x: (x[0], x[1], tokenizer.tokenize(x[0])))
+
+# Convert to LabeledPoint
+labeled_data = tokenized_data.map(lambda x: (1.0 if x[1] == "positive" else 0.0 if x[1] == "neutral" else -1.0, x[2]))
+
+# Combine all tokens for CountVectorizer
+all_tokens = labeled_data.flatMap(lambda x: x[1])
+
+# Fit CountVectorizer on all tokens
+vectorizer = CountVectorizer()
+vectorizer.fit(all_tokens.collect())
+
+# Transform tokenized_data to feature vectors
+tf_data = labeled_data.map(lambda x: (x[0], vectorizer.transform(x[1]).toarray().flatten()))
+
+# Convert to LabeledPoint
+labeled_points = tf_data.map(lambda x: LabeledPoint(x[0], x[1]))
+
+# Train SVM model
+model = SVC()
+X_train = labeled_points.map(lambda x: x.features).collect()
+y_train = labeled_points.map(lambda x: x.label).collect()
+model.fit(X_train, y_train)
+
+# Save the model
+joblib.dump(model, "svm_model_and_cv.pkl")
+
+# Stop Spark context
+sc.stop()

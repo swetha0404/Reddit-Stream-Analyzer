@@ -1,0 +1,12 @@
+I'm working on a project to summarize a stream of data from Reddit posts regarding Biden and Trump. Below is a JSON format of posts that I filtered from Reddit. Using them, give me a paraphrased version of the opinion of people on Reddit or from titles along with a summary, don't give a list of what is present in the data below, but use it to form a good summary and compare andÂ contrastÂ them:
+
+Paragraphs to summarise
+
+Biden's Opinion :
+US solar manufacturers target China-linked imports in new plea to Biden  These illegal immigrants are eligible for Obamacare after Biden rule change  Holy Shit! In 4 years of the Biden Regime this is the only yard sign I have seen. I had to pull over to take a snap. Biden Supporters do exist.   US diplomat who quit over Biden administration’s Gaza policy speaks out  US diplomat who quit over Biden administration’s Gaza policy speaks out  Bernie Breaks His Silence: Biden Is "Alienating" Young People (The Rational National)  Maher: Biden’s Loan Plan Is ‘Tax Dollars’ ‘Supporting This Jew-Hating’ on Campus
+
+Trump's Opinion :
+Tax Rates for Big Corporations Fell by Nearly Half After Trump Cuts | And this is the policy Republicans and their presumptive presidential nominee are vowing to extend if they win in November.  I wish trump was president for life.  "Weirdest moment": Experts call out Trump lawyers' "planted evidence" defense over damning recording  [FS] - Central New York - 100$ 20gallon tank, will take the Best offer i just had to put a price 
+this picture is when my tank was thriving. the plants in the middle have died off i believe and so have the plants on the right. if you would like pictures of the tank in its current state, i will send them.
+
+I used to keep this tank in pristine condition but over time my love for it died down. the tank has had algae in it but it is all salvageable. in the tank is Black sand, Dragonstone, spiderwood, jungle valsinaria, subwassertang. heater and Hob filter included along with a light. currently only has malaysian trumpet snails living in it. Donald Trump ‘would force Nato members to spend 3% on defence’  Donald Trump ‘would force Nato members to spend 3% on defence’  Trump https://x.com/ILA_NewsX/status/1786730276477165608 Donald Trump supporters wear nappies | US News  POLITICS SEC charges Trump Media auditor with ‘massive fraud’ on hundreds of companies, imposes lifetime ban
